@@ -19,4 +19,4 @@ class bootRom:
         return(self.rom[address:address + lenght])
     
     def write(self, adress, data):
-        print(f"Boot Rom: Write unsuported")
+        print(f"Boot Rom: Write unsuported (Address: 0x{adress:08x}, Value: {data:08x})")

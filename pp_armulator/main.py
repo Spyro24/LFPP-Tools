@@ -1,6 +1,7 @@
 import unknownDevice
 import nand
 import bootRom
+import ram
 import helper
 
 #CPU Mode Table
@@ -19,22 +20,23 @@ class CPU:
     def __init__(self):
         self.mode = MODE_SVC
         self.halted = False
-        self.bus = [bootRom.bootRom(0x0, 0x5FF0),
+        self.bus = [ram.SDRAM(0x0, 0x00FFFFFF),
                     unknownDevice.unknown(0xc00000c4, 0xc00000cc),
-                    unknownDevice.unknown(0xff000000, 0xff000000),
+                    unknownDevice.unknown(0xff000000, 0xff000000), #P_CACHE_CTRL
                     unknownDevice.unknown(0xd0100038, 0xd0100038),
                     unknownDevice.unknown(0xd0300000, 0xd03000c0),
                     unknownDevice.unknown(0xd05001fc, 0xd05001fc),
                     unknownDevice.unknown(0xd07023c0, 0xd07023c0),
                     nand.nand(0xD0900000, 0xD09001FF),
                     unknownDevice.unknown(0xd0d00000, 0xd0d00000),
-                    unknownDevice.unknown(0xf8000000, 0xf8001FFF), #ISRAM (internal_static_ram)
+                    ram.ISRAM(0xf8000000, 0xf8009800), #ISRAM (internal_static_ram)
                     #unknownDevice.unknown(0xfffffffc, 0xfffffffc), #Stack (but it cant be the stack)
                     ]
         self.registers = {"R0": 0x0,
                           "R1": 0x0,
                           "R2": 0x0,
                           "R3": 0x0,
+                          "R12": 0x0,
                           "pc":0x0,
                           "cpsr":0xD3}
         self.regLookup = {0: "R0",
@@ -42,24 +44,183 @@ class CPU:
                           2: "R2",
                           3: "R3",
                           15: "pc"}
-        self.registerBanks = {}
+        self.registerBanks = {MODE_SVC:{13: 0x0, 14: 0x0}}
         self.flags = {"carry": 0, "overflow": 0}
         #steps
         self.stepFetch = 0xE1A00000 #Nop
         self.stepDecode = 0xE1A00000 #Nop
         self.stepExecute = 0xE1A00000 #Nop
-        self.programmCounters = [0, 0]
+        self.programmCounters = [-1, -1]
         
-        self.instructionMap = {"dp": self.Idp, "sdt": self.Isdt}
+        self.instructionMap = {"dp": self.Idp, "sdt": self.Isdt, "b": self.Ibranch, "bdt": self.Ibdt,
+                               "bx": self.Ibx, "msr": self.Imsr}
     
     # --- Memory ---
     def read(self, address, lenght):
         for device in self.bus:
-            if device.mapingBegin <= address and address + lenght <= device.mapingEnd:
+            if device.mapingBegin <= address <= device.mapingEnd:
                 return int.from_bytes(device.read(address, lenght), "little")
-        raise EmuError(f"no device is maped to 0x{address:08x}")
+        raise EmuError(f"Read: No device is maped to 0x{address:08x}")
+    
+    def write(self, a, n, v):
+        isDevice = False
+        for device in self.bus:
+            if device.mapingBegin <= a <= device.mapingEnd:
+                device.write(a, v)
+                isDevice = True
+                break
+        if not isDevice:
+            raise EmuError(f"bus fault writing 0x{a:08x}")
     
     #--- Instructions ---
+    def Imsr(self, instruction):
+        # Wert bestimmen
+        if helper.bit(instruction, 25):
+            # Sofortwert mit Rotation
+            immediate_value = instruction & 0xFF
+            rotation = ((instruction >> 8) & 0x0F) * 2
+            value = helper.ror(immediate_value, rotation)
+        else:
+            # Wert aus einem Register
+            register_number = instruction & 0x0F
+            value = self.readRegister(register_number)
+
+        # Bestimmen, welche PSR-Felder geschrieben werden
+        field_mask = 0
+
+        # Control-Feld: Bits 0–7
+        if helper.bit(instruction, 16):
+            field_mask |= 0x000000FF
+
+        # Extension-Feld: Bits 8–15
+        if helper.bit(instruction, 17):
+            field_mask |= 0x0000FF00
+
+        # Status-Feld: Bits 16–23
+        if helper.bit(instruction, 18):
+            field_mask |= 0x00FF0000
+
+        # Flags-Feld: Bits 24–31
+        if helper.bit(instruction, 19):
+            field_mask |= 0xFF000000
+
+        # SPSR schreiben
+        if helper.bit(instruction, 22):
+            self.spsr = (
+                (self.spsr & ~field_mask) |
+                (value & field_mask)
+            )
+            return
+
+        # Aktuellen CPSR-Wert aus dem Register holen
+        cpsr = self.registers["cpsr"]
+
+        # Flags-Feld schreiben
+        if field_mask & 0xFF000000:
+            cpsr = (
+                (cpsr & ~0xFF000000) |
+                (value & 0xFF000000)
+            )
+
+        # Control-Feld schreiben
+        if field_mask & 0x000000FF:
+            # Das Thumb-Bit befindet sich in Bit 5.
+            # Es darf durch MSR nicht verändert werden.
+            old_thumb_bit = cpsr & 0x20
+
+            new_control = value & 0xDF
+            cpsr = (
+                (cpsr & ~0x000000FF) |
+                new_control |
+                old_thumb_bit
+            )
+
+        # Geänderten CPSR-Wert zurückschreiben
+        self.registers["cpsr"] = cpsr
+    
+    def Ibx(self, instruction):
+        print(instruction & 15)
+        target = self.readRegister(instruction & 15)
+        if target & 1: raise EmuError("BX to Thumb state is not supported")
+        self.setRegister(15, target)
+    
+    def Ibdt(self, instruction):
+        # Decode instruction flags
+        pre_index = helper.bit(instruction, 24)   # P: use pre-indexed addressing
+        increment = helper.bit(instruction, 23)   # U: increment instead of decrement
+        write_back = helper.bit(instruction, 21)  # W: update the base register
+        load = helper.bit(instruction, 20)        # L: load from memory; otherwise store
+
+        # Bits 19–16 specify the base register
+        base_register = (instruction >> 16) & 0xF
+
+        # Bits 0–15 specify which registers participate in the transfer
+        registers = [register_number for register_number in range(16) if helper.bit(instruction, register_number)]
+
+        register_count = len(registers)
+        base_address = self.readRegister(base_register)
+
+        # Calculate the first memory address and the write-back value
+        if increment:
+            if pre_index:
+                address = base_address + 4
+            else:
+                address = base_address
+
+            write_back_address = base_address + 4 * register_count
+
+        else:
+            if pre_index:
+                address = base_address - 4 * register_count
+            else:
+                address = base_address - 4 * register_count + 4
+
+            write_back_address = base_address - 4 * register_count
+
+        # Keep the address within 32 bits
+        address &= helper.M32
+
+        # For a load with write-back, update the base register first.
+        # If the base register is also in the register list, the loaded
+        # value will replace this value later.
+        if write_back and load:
+            self.setRegister(base_register, write_back_address)
+
+        # Transfer each selected register
+        for register_number in registers:
+            aligned_address = address & ~3
+
+            if load:
+                # Load a value from memory into the register
+                value = self.read(aligned_address, 4)
+                self.setRegister(register_number, value)
+
+            else:
+                # Store the register value in memory.
+                # Reading r15 uses its ARM-visible PC value, four bytes ahead.
+                value = self.readRegister(register_number)
+
+                if register_number == 15:
+                    value += 4
+
+                self.write(aligned_address, 4, value)
+
+            # Move to the next word in memory
+            address = (address + 4) & helper.M32
+
+        # For stores, write back after the transfer.
+        # This prevents the updated base address from affecting the stored value
+        # when the base register is included in the register list.
+        if write_back and not load:
+            self.setRegister(base_register, write_back_address)
+    
+    def Ibranch(self, instruction):
+        rawOffset = instruction & 0xFFFFFF
+        branchOffset = helper.sext(rawOffset, 24) << 2
+        linkBitSet = helper.bit(instruction, 24)
+        if linkBitSet: self.setRegister(14, (self.readRegister(15) - 4) & helper.M32)
+        self.setRegister(15, self.readRegister(15) + branchOffset)
+    
     def Isdt(self, instruction):
         isPreIndexed = helper.bit(instruction, 24)
         addsOffset = helper.bit(instruction, 23)
@@ -93,7 +254,7 @@ class CPU:
             # Store a word.
             else:
                 alignedAddress = memoryAddress & ~3
-                self.write(aligned_address, 4, value)
+                self.write(alignedAddress, 4, value)
         if writesBack or not isPreIndexed: self.setRegister(baseRegister, updatedAddress)
         if isLoad: self.setRegister(dataRegister, value)
     
@@ -119,7 +280,7 @@ class CPU:
             case 13:
                 result = operand2
             case 14:
-                result = operand1 & ~operand2 & helper.M32
+                result = (operand1 & ~operand2) & helper.M32
             case 15:
                 result = ~operand2 & helper.M32
             case 2 | 10:
@@ -166,20 +327,40 @@ class CPU:
             self.setRegister(destinationRegister, result)
     
     #-- register stuff ---
-    def set_nz(self, v, bits=32):
-        self.registers['cpsr'] = (self.registers['cpsr'] & ~(1 << 31)) | (((v >> (bits - 1)) & 1) << 31)
-        self.registers['cpsr'] = (self.registers['cpsr'] & ~(1 << 30)) | (((int(v == 0)) & 1) << 30)
+    def set_nz(self, value, bits=32):
+        self.registers['cpsr'] = (self.registers['cpsr'] & ~(1 << 31)) | (((value >> (bits - 1)) & 1) << 31)
+        self.registers['cpsr'] = (self.registers['cpsr'] & ~(1 << 30)) | (((int(value == 0)) & 1) << 30)
     
-    def setRegister(self, i, v):
-        v &= helper.M32
-        if i == 15:
-            v &= ~3
+    def setRegister(self, regId, value):
+        value &= helper.M32
+        if 0 <= regId <= 7:
+            self.registers[f"R{regId}"] = value
+        if 8 <= regId <= 12:
+            if self.registers['cpsr'] & 0x1F == MODE_FIQ:
+                pass
+            else:
+                pass
+        
+        if regId in (13, 14):
+            self.registerBanks[self.registers['cpsr'] & 0x1F][regId] = value
+        if regId == 15:
+            value &= ~3
             self.branched = True
             self.flushPipeline()
-        self.registers[self.regLookup[i]] = v
+            self.registers["pc"] = value
     
     def readRegister(self, regId: int):
-        return self.registers[self.regLookup[regId]]
+        if 0 <= regId <= 7:
+            return self.registers[f"R{regId}"]
+        if 8 <= regId <= 12:
+            if self.registers['cpsr'] & 0x1F == MODE_FIQ:
+                pass
+            else:
+                return self.registers[f"R{regId}"]
+        if regId in (13, 14):
+            return self.registerBanks[self.registers['cpsr'] & 0x1F][regId]
+        if regId == 15:
+            return self.registers["pc"]
     #--- Helper functions ---
     def shifter(self, i):
         if helper.bit(i, 25):
@@ -190,7 +371,7 @@ class CPU:
     
     def shift_reg(self, i):
         rm, typ = i & 15, (i >> 5) & 3
-        val = self.registers[self.regLookup[rm]]
+        val = self.readRegister(rm)
         if i & 0x10:                              # shift amount from register
             if rm == 15:
                 val += 4                          # PC reads as addr+12 here
@@ -201,6 +382,7 @@ class CPU:
         self.stepFetch = 0xE1A00000
         self.stepDecode = 0xE1A00000
         self.stepExecute = 0xE1A00000
+        self.programmCounters = [-1, -1]
     #--- Execute instruction ---
     def execute(self):
         instruction = self.instructionMap.get(helper.decode(self.stepExecute))
@@ -210,6 +392,7 @@ class CPU:
     
     #--- CPU control ---
     def step(self, disassemble=False):
+        self.branched = False
         pc = self.registers["pc"]
         exeThumb = (self.registers["cpsr"] >> 5) & 1
         self.stepExecute = self.stepDecode
@@ -220,11 +403,13 @@ class CPU:
         instr = self.stepExecute
         pcAtInsLoad = self.programmCounters.pop(0)
         if disassemble:
-            text = helper.disasm(instr, pcAtInsLoad)
-            print(f"{pcAtInsLoad:08x}: {text}")
+            if pcAtInsLoad != -1:
+                text = helper.disasm(instr, pcAtInsLoad)
+                print(f"{pcAtInsLoad:08x}: {text}")
         try:
             self.execute()
-            self.registers["pc"] += 2 if exeThumb else 4
+            if not self.branched:
+                self.registers["pc"] += 2 if exeThumb else 4
         except EmuError as e:
             print(f"Emu error: {e}")
             print("pipeline dump:")
@@ -233,8 +418,13 @@ class CPU:
                 instr = self.stepExecute
                 self.stepExecute = self.stepDecode
                 self.stepDecode = None
-                print(f"    {pcAtInsLoad:08x}: {text}")
-            exit()
+                if pcAtInsLoad != -1:
+                    text = helper.disasm(instr, pcAtInsLoad)
+                    print(f"    {pcAtInsLoad:08x}: {text}")
+                else: print("    Pipeline was flushed")
+            print("Registers:")
+            print(self.registers)
+            self.halted = True
         
             
         
@@ -242,5 +432,6 @@ class CPU:
 if __name__ == "__main__":
     cpu = CPU()
     cpu.bus[0].mountImage("boot_rom")
-    while True:
-        cpu.step(True)
+    while not cpu.halted:
+        cpu.step()
+    cpu.bus[-1].dump()

@@ -7,8 +7,9 @@ class unknown:
     def mountImage(self, imageFile):
         pass
     
-    def read(self):
-        pass
+    def read(self, address, lenght):
+        print(f"UNKNOWN: trying to read from {address:08x}")
+        return bytes(lenght)
     
     def write(self, adress, data):
         print(f"UNKNOWN: {data:08x} writen to adress {adress:08x}")
