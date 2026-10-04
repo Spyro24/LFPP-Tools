@@ -13,11 +13,14 @@ MODE_ABT = 0b10111 #Abort
 MODE_UND = 0b11011 #Undefined
 MODE_SYS = 0b11111 #System
 
+modeNames = {MODE_SVC: "Supervisor", MODE_FIQ: "FIQ"}
+
 class EmuError(Exception):
     pass
 
 class CPU:
-    def __init__(self):
+    def __init__(self, debug=False):
+        self.debug = debug
         self.mode = MODE_SVC
         self.halted = False
         self.bus = [ram.SDRAM(0x0, 0x00FFFFFF),
@@ -114,6 +117,7 @@ class CPU:
 
         # Aktuellen CPSR-Wert aus dem Register holen
         cpsr = self.registers["cpsr"]
+        lastMode = cpsr & 0x1F
 
         # Flags-Feld schreiben
         if field_mask & 0xFF000000:
@@ -137,6 +141,8 @@ class CPU:
 
         # Geänderten CPSR-Wert zurückschreiben
         self.registers["cpsr"] = cpsr
+        if self.debug:
+            print(f"Mode change: changed {modeNames[lastMode]} to {modeNames[cpsr & 0x1F]}")
     
     def Ibx(self, instruction):
         print(instruction & 15)
@@ -263,66 +269,118 @@ class CPU:
         updateFlags = helper.bit(instruction, 20)
         firstRegister = (instruction >> 16) & 0xF
         destinationRegister = (instruction >> 12) & 0xF
+
         operand1 = self.registers[self.regLookup[firstRegister]]
         operand2, shifterCarry = self.shifter(instruction)
+
         usesImmediateOperand = not helper.bit(instruction, 25)
-        carryIn = self.flags["carry"]
+
+        cpsr = self.registers["cpsr"]
+        carryIn = (cpsr >> 29) & 1
+
         carryOut = 0
         overflow = 0
+
         arithmeticOperation = opcode in {2, 3, 4, 5, 6, 7, 10, 11}
+
         match opcode:
             case 0 | 8:
                 result = operand1 & operand2
+
             case 1 | 9:
                 result = operand1 ^ operand2
+
             case 12:
                 result = operand1 | operand2
+
             case 13:
                 result = operand2
+
             case 14:
                 result = (operand1 & ~operand2) & helper.M32
+
             case 15:
                 result = ~operand2 & helper.M32
+
             case 2 | 10:
                 left = operand1
                 right = ~operand2
                 extraCarry = 1
+
             case 3:
                 left = operand2
                 right = ~operand1
                 extraCarry = 1
+
             case 4 | 11:
                 left = operand1
                 right = operand2
                 extraCarry = 0
+
             case 5:
                 left = operand1
                 right = operand2
                 extraCarry = carryIn
+
             case 6:
                 left = operand1
                 right = ~operand2
                 extraCarry = carryIn
+
             case 7:
                 left = operand2
                 right = ~operand1
                 extraCarry = carryIn
+
         if arithmeticOperation:
             left &= helper.M32
             right &= helper.M32
+
             fullResult = left + right + extraCarry
             result = fullResult & helper.M32
-            carryOut = fullResult >> 32
+
+            carryOut = (fullResult >> 32) & 1
             overflow = (((~(left ^ right)) & (left ^ result)) >> 31) & 1
+
         isTestOperation = 8 <= opcode <= 11
+
         if updateFlags and (isTestOperation or destinationRegister != 15):
-            self.set_nz(result)
+            # N flag
+            if result & 0x80000000:
+                cpsr |= (1 << 31)
+            else:
+                cpsr &= ~(1 << 31)
+
+            # Z flag
+            if result == 0:
+                cpsr |= (1 << 30)
+            else:
+                cpsr &= ~(1 << 30)
+
             if arithmeticOperation:
-                self.flags['carry'] = carryOut
-                self.flags["overflow"] = overflow
-        else:
+                # C flag
+                if carryOut:
+                    cpsr |= (1 << 29)
+                else:
+                    cpsr &= ~(1 << 29)
+
+                # V flag
+                if overflow:
+                    cpsr |= (1 << 28)
+                else:
+                    cpsr &= ~(1 << 28)
+
+            self.registers["cpsr"] = cpsr
+
+        elif updateFlags:
             # Logical instructions take C from the barrel shifter.
-            self.flags['carry'] = shifterCarry
+            if shifterCarry:
+                cpsr |= (1 << 29)
+            else:
+                cpsr &= ~(1 << 29)
+
+            self.registers["cpsr"] = cpsr
+
         if not isTestOperation:
             self.setRegister(destinationRegister, result)
     
@@ -330,6 +388,7 @@ class CPU:
     def set_nz(self, value, bits=32):
         self.registers['cpsr'] = (self.registers['cpsr'] & ~(1 << 31)) | (((value >> (bits - 1)) & 1) << 31)
         self.registers['cpsr'] = (self.registers['cpsr'] & ~(1 << 30)) | (((int(value == 0)) & 1) << 30)
+        
     
     def setRegister(self, regId, value):
         value &= helper.M32
@@ -383,6 +442,33 @@ class CPU:
         self.stepDecode = 0xE1A00000
         self.stepExecute = 0xE1A00000
         self.programmCounters = [-1, -1]
+    
+    def checkCondition(self, condCode):
+        cpsr = self.registers['cpsr']
+        n = (cpsr >> 31) & 1
+        z = (cpsr >> 30) & 1
+        c = (cpsr >> 29) & 1
+        v = (cpsr >> 28) & 1
+        
+        conditions = {
+            0x0: z,                # EQ
+            0x1: not z,            # NE
+            0x2: c,                # CS
+            0x3: not c,            # CC
+            0x4: n,                # MI
+            0x5: not n,            # PL
+            0x6: v,                # VS
+            0x7: not v,            # VC
+            0x8: c and not z,      # HI
+            0x9: not c or z,       # LS
+            0xA: n == v,           # GE
+            0xB: n != v,           # LT
+            0xC: not z and n == v, # GT
+            0xD: z or n != v,      # LE
+            0xE: True,             # AL
+            0xF: False,            # NV
+        }
+        return conditions.get(condCode)
     #--- Execute instruction ---
     def execute(self):
         instruction = self.instructionMap.get(helper.decode(self.stepExecute))
@@ -402,14 +488,17 @@ class CPU:
         text = ""
         instr = self.stepExecute
         pcAtInsLoad = self.programmCounters.pop(0)
-        if disassemble:
-            if pcAtInsLoad != -1:
-                text = helper.disasm(instr, pcAtInsLoad)
-                print(f"{pcAtInsLoad:08x}: {text}")
+        skiped = True
         try:
-            self.execute()
+            if self.checkCondition((self.stepExecute >> 28) & 0xF):
+                self.execute()
+                skiped = False
             if not self.branched:
                 self.registers["pc"] += 2 if exeThumb else 4
+            if disassemble:
+                if pcAtInsLoad != -1:
+                    text = helper.disasm(instr, pcAtInsLoad)
+                    print(f"{pcAtInsLoad:08x}: {text}{'; skiped' if skiped else ''}")
         except EmuError as e:
             print(f"Emu error: {e}")
             print("pipeline dump:")
@@ -430,8 +519,8 @@ class CPU:
         
 
 if __name__ == "__main__":
-    cpu = CPU()
+    cpu = CPU(debug=True)
     cpu.bus[0].mountImage("boot_rom")
     while not cpu.halted:
-        cpu.step()
+        cpu.step(True)
     cpu.bus[-1].dump()
